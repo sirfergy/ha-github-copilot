@@ -138,3 +138,17 @@ async def test_close_drains_cleanup_before_stopping(
     await runtime.async_close()
     assert seen == [False]
     assert client.stopped
+
+
+async def test_stop_notifies_listeners(
+    hass: HomeAssistant, mock_copilot: type[FakeCopilotClient]
+) -> None:
+    """Listeners fire once on close and unsubscribed ones don't."""
+    runtime = CopilotRuntime(hass, "token")
+    await runtime.async_start()
+    calls: list[str] = []
+    runtime.async_on_stop(lambda: calls.append("a"))
+    unsubscribe = runtime.async_on_stop(lambda: calls.append("b"))
+    unsubscribe()
+    await runtime.async_close()
+    assert calls == ["a"]

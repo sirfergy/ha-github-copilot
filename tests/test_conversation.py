@@ -440,3 +440,31 @@ async def test_session_teardown_survives_abort_failure(
     assert session.aborted
     assert session.disconnected
     assert client.deleted == [session.session_id]
+
+
+async def test_in_flight_request_fails_fast_on_reload(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+) -> None:
+    """Reloading the entry ends in-flight requests instead of hanging."""
+    import asyncio
+
+    client = mock_copilot_client(hass)
+    streaming = asyncio.Event()
+
+    async def script(session: FakeSession) -> None:
+        session.say("partial")
+        streaming.set()
+
+    client.script = script
+    request = hass.async_create_task(_ask(hass, "tell me a long story"))
+    await streaming.wait()
+
+    async with asyncio.timeout(5):
+        await hass.config_entries.async_reload(mock_config_entry.entry_id)
+        result = await request
+
+    assert result.response.response_type is intent.IntentResponseType.ERROR
+    assert "runtime stopped" in result.response.speech["plain"]["speech"]
+    assert client.stopped

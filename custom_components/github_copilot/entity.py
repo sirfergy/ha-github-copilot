@@ -170,7 +170,7 @@ class GitHubCopilotBaseLLMEntity(Entity):
         assert isinstance(user_content, conversation.UserContent)
 
         model_id = self._model_id
-        model = self._runtime.models.get(model_id)
+        model = await self._async_get_model(model_id)
 
         prompt = _build_prompt(chat_log.content[1:user_index], user_content.content)
         response_schema: dict[str, Any] | None = None
@@ -222,6 +222,15 @@ class GitHubCopilotBaseLLMEntity(Entity):
             session_options["reasoning_effort"] = effort
 
         session, session_client = await self._async_create_session(session_options)
+        unsubscribe_stop = self._runtime.async_on_stop(
+            partial(
+                run.emit,
+                CopilotRequestError(
+                    "The GitHub Copilot runtime stopped (the integration was "
+                    "reloaded or Home Assistant is shutting down)"
+                ),
+            )
+        )
 
         completed = False
         try:
@@ -248,9 +257,30 @@ class GitHubCopilotBaseLLMEntity(Entity):
         except Exception as err:
             raise HomeAssistantError(f"GitHub Copilot request failed: {err}") from err
         finally:
+            unsubscribe_stop()
             self._runtime.async_schedule_cleanup(
                 _async_close_session(session_client, session, abort=not completed)
             )
+
+    async def _async_get_model(self, model_id: str) -> CopilotModel:
+        """Return metadata for the configured model, refusing unknown ids.
+
+        Copilot silently substitutes another (possibly premium) model for an
+        unknown id, so a typo must fail loudly instead.
+        """
+        runtime = self._runtime
+        if (model := runtime.models.get(model_id)) is None and runtime.client:
+            try:
+                await runtime.async_refresh_models()
+            except Exception:
+                LOGGER.debug("Unable to refresh the Copilot model list", exc_info=True)
+            model = runtime.models.get(model_id)
+        if model is None:
+            raise HomeAssistantError(
+                f"Model '{model_id}' isn't available to this GitHub account; "
+                "reconfigure the GitHub Copilot integration"
+            )
+        return model
 
     async def _async_create_session(
         self, options: dict[str, Any]

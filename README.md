@@ -55,7 +55,7 @@ Open the integration and use **⋮ → Reconfigure** on a service, or **Add conv
 
 | Option | Applies to | Description |
 | --- | --- | --- |
-| Model | both | Any model your plan allows. The list comes from your account, and you can also type a model ID. |
+| Model | both | Any model your plan allows. The list comes from your account. Unknown IDs are rejected because Copilot would otherwise silently switch to a different model. |
 | Reasoning effort | both | `low` (default) keeps voice responses snappy. Higher effort is slower but can be smarter. Models without reasoning support ignore it. |
 | Instructions | conversation | System prompt, which supports templates. |
 | Control Home Assistant | conversation | Which LLM APIs (usually **Assist**) Copilot may use as tools. |

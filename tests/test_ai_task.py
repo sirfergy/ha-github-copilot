@@ -24,6 +24,10 @@ def _client() -> FakeCopilotClient:
     return FakeCopilotClient.instances[-1]
 
 
+def _client_runtime(entry: MockConfigEntry):
+    return entry.runtime_data
+
+
 def _reply(text: str):
     async def script(session: FakeSession) -> None:
         session.say(text)
@@ -230,7 +234,9 @@ async def test_attachment_hard_cap_for_unknown_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Custom model ids without metadata still get the integration's caps."""
+    """Models that don't advertise limits still get the integration's caps."""
+    from .conftest import _model
+
     monkeypatch.setattr(
         "custom_components.github_copilot.entity.MAX_ATTACHMENT_BYTES", 10
     )
@@ -243,6 +249,8 @@ async def test_attachment_hard_cap_for_unknown_model(
         mock_config_entry, subentry, data={CONF_CHAT_MODEL: "my-custom-model"}
     )
     await hass.async_block_till_done()
+    _client().models.append(_model("my-custom-model", vision_limits=False))
+    await _client_runtime(mock_config_entry).async_refresh_models()
     image = tmp_path / "a.png"
     image.write_bytes(b"x" * 11)
     with (
@@ -250,3 +258,36 @@ async def test_attachment_hard_cap_for_unknown_model(
         pytest.raises(HomeAssistantError, match="larger than 10 bytes"),
     ):
         await _generate_with_image(hass, image, "image/png")
+
+
+async def test_unknown_model_is_refused(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+) -> None:
+    """Copilot would silently substitute a model, so unknown ids fail loudly."""
+    subentry = next(
+        s
+        for s in mock_config_entry.subentries.values()
+        if s.subentry_type == SUBENTRY_AI_TASK
+    )
+    hass.config_entries.async_update_subentry(
+        mock_config_entry, subentry, data={CONF_CHAT_MODEL: "not-a-real-model"}
+    )
+    await hass.async_block_till_done()
+    with pytest.raises(HomeAssistantError, match="isn't available"):
+        await ai_task.async_generate_data(
+            hass, task_name="x", entity_id=ENTITY_ID, instructions="hi"
+        )
+    assert _client().sessions == []
+
+    # A model added to the account later is picked up without a reload.
+    from .conftest import _model
+
+    _client().models.append(_model("not-a-real-model"))
+    _client().script = _reply("ok")
+    result = await ai_task.async_generate_data(
+        hass, task_name="x", entity_id=ENTITY_ID, instructions="hi"
+    )
+    assert result.data == "ok"
+    assert _client().sessions[-1].options["model"] == "not-a-real-model"

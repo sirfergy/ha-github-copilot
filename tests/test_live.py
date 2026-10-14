@@ -194,3 +194,57 @@ async def test_live_ai_task_text(
     )
     print("DATA:", result.data)
     assert "pong" in result.data.lower()
+
+
+async def test_live_reload_ends_in_flight_request(
+    hass: HomeAssistant, live_entry: MockConfigEntry
+) -> None:
+    """Reloading mid-request fails fast instead of waiting for the timeout."""
+    import asyncio
+    import time
+
+    request = hass.async_create_task(
+        ai_task.async_generate_data(
+            hass,
+            task_name="story",
+            entity_id="ai_task.copilot_task",
+            instructions="Write a 600 word story about a lighthouse keeper.",
+        )
+    )
+    await asyncio.sleep(2)
+    started = time.monotonic()
+    await hass.config_entries.async_reload(live_entry.entry_id)
+    with pytest.raises(Exception, match="runtime stopped"):
+        await request
+    elapsed = time.monotonic() - started
+    print("FAILED FAST AFTER", round(elapsed, 2), "s")
+    assert elapsed < 20
+    assert live_entry.state is ConfigEntryState.LOADED
+
+    result = await ai_task.async_generate_data(
+        hass,
+        task_name="after",
+        entity_id="ai_task.copilot_task",
+        instructions="Reply with exactly the word: pong",
+    )
+    assert "pong" in result.data.lower()
+
+
+async def test_live_unknown_model_refused(
+    hass: HomeAssistant, live_entry: MockConfigEntry
+) -> None:
+    """A typo'd model id fails instead of silently using another model."""
+    subentry = next(
+        s for s in live_entry.subentries.values() if s.subentry_type == SUBENTRY_AI_TASK
+    )
+    hass.config_entries.async_update_subentry(
+        live_entry, subentry, data={CONF_CHAT_MODEL: "not-a-real-model"}
+    )
+    await hass.async_block_till_done()
+    with pytest.raises(Exception, match="isn't available"):
+        await ai_task.async_generate_data(
+            hass,
+            task_name="x",
+            entity_id="ai_task.copilot_task",
+            instructions="hi",
+        )

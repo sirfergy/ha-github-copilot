@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from functools import partial
 import os
@@ -94,6 +94,23 @@ class CopilotRuntime:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _closed: bool = False
     _cleanup_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    _stop_listeners: set[Callable[[], None]] = field(default_factory=set)
+
+    @callback
+    def async_on_stop(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Call ``listener`` if the runtime stops; returns an unsubscribe.
+
+        The SDK emits nothing to in-flight sessions when its process exits, so
+        requests register here to fail fast instead of waiting for a timeout.
+        """
+        self._stop_listeners.add(listener)
+        return partial(self._stop_listeners.discard, listener)
+
+    @callback
+    def _notify_stop(self) -> None:
+        listeners, self._stop_listeners = self._stop_listeners, set()
+        for listener in listeners:
+            listener()
 
     @callback
     def async_schedule_cleanup(self, target: Coroutine[Any, Any, None]) -> None:
@@ -121,6 +138,7 @@ class CopilotRuntime:
     async def async_close(self) -> None:
         """Stop for good (entry unload or Home Assistant shutdown)."""
         self._closed = True
+        self._notify_stop()
         # Let in-flight session cleanup finish (each step is bounded) so no
         # RPC is cancelled mid-flight while the runtime process exits.
         if self._cleanup_tasks:
@@ -210,6 +228,7 @@ class CopilotRuntime:
 
     async def _async_stop(self) -> None:
         """Stop the runtime subprocess and remove its scratch directories."""
+        self._notify_stop()
         client, self.client = self.client, None
         root_dir, self._root_dir = self._root_dir, None
         try:

@@ -65,6 +65,7 @@ def _model(
     vision: bool = True,
     efforts: list[str] | None = None,
     enabled: bool = True,
+    vision_limits: bool = True,
 ) -> ModelInfo:
     return ModelInfo(
         id=model_id,
@@ -77,7 +78,7 @@ def _model(
                     max_prompt_images=2,
                     max_prompt_image_size=1024,
                 )
-                if vision
+                if vision and vision_limits
                 else None
             ),
         ),

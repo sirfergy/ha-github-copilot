@@ -281,3 +281,36 @@ async def test_subentry_requires_loaded_entry(
     )
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "entry_not_loaded"
+
+
+async def test_subentry_rejects_unknown_model(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+) -> None:
+    """Typos in a custom model id are caught in the form."""
+    result = await hass.config_entries.subentries.async_init(
+        (mock_config_entry.entry_id, SUBENTRY_AI_TASK),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Typo",
+            CONF_CHAT_MODEL: "gpt-5-minii",
+            CONF_REASONING_EFFORT: "low",
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_CHAT_MODEL: "model_not_found"}
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Typo",
+            CONF_CHAT_MODEL: "gpt-5-mini",
+            CONF_REASONING_EFFORT: "low",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Typo"

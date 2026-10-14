@@ -61,6 +61,9 @@
       "abort": {
         "entry_not_loaded": "The GitHub Copilot entry must be loaded first.",
         "reconfigure_successful": "Reconfiguration was successful."
+      },
+      "error": {
+        "model_not_found": "This model isn't available to your GitHub account."
       }
     },
     "ai_task_data": {
@@ -86,6 +89,9 @@
       "abort": {
         "entry_not_loaded": "The GitHub Copilot entry must be loaded first.",
         "reconfigure_successful": "Reconfiguration was successful."
+      },
+      "error": {
+        "model_not_found": "This model isn't available to your GitHub account."
       }
     }
   },

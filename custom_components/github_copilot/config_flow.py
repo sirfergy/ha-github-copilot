@@ -266,6 +266,13 @@ class LLMSubentryFlowHandler(ConfigSubentryFlow):
             return self.async_abort(reason="entry_not_loaded")
         runtime: CopilotRuntime = entry.runtime_data
 
+        errors: dict[str, str] = {}
+        if user_input is not None and user_input[CONF_CHAT_MODEL] not in runtime.models:
+            # Copilot silently substitutes another model for unknown ids.
+            errors[CONF_CHAT_MODEL] = "model_not_found"
+            self.options = {**self.options, **user_input}
+            user_input = None
+
         if user_input is not None:
             options = {**self.options, **user_input}
             if self._subentry_type == SUBENTRY_CONVERSATION:
@@ -293,7 +300,11 @@ class LLMSubentryFlowHandler(ConfigSubentryFlow):
                 if self._subentry_type == SUBENTRY_AI_TASK
                 else DEFAULT_CONVERSATION_NAME
             )
-            schema[probatio.Required(CONF_NAME, default=default_name)] = str
+            schema[
+                probatio.Required(
+                    CONF_NAME, default=self.options.get(CONF_NAME, default_name)
+                )
+            ] = str
         if self._subentry_type == SUBENTRY_CONVERSATION:
             schema[
                 probatio.Optional(
@@ -348,4 +359,6 @@ class LLMSubentryFlowHandler(ConfigSubentryFlow):
             )
         )
 
-        return self.async_show_form(step_id="init", data_schema=probatio.Schema(schema))
+        return self.async_show_form(
+            step_id="init", data_schema=probatio.Schema(schema), errors=errors
+        )
