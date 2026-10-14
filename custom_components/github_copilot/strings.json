@@ -1,0 +1,103 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect GitHub Copilot",
+        "description": "Create a fine-grained personal access token at https://github.com/settings/personal-access-tokens/new with the **Copilot Requests** account permission (read-only), then paste it below. Requests are billed to your Copilot plan. The first setup downloads the Copilot runtime (~120 MB), which can take a minute.",
+        "data": {
+          "access_token": "Access token"
+        },
+        "data_description": {
+          "access_token": "Fine-grained personal access token with the Copilot Requests permission."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate GitHub Copilot",
+        "description": "The stored token no longer works. Paste a new fine-grained personal access token with the **Copilot Requests** permission.",
+        "data": {
+          "access_token": "Access token"
+        }
+      }
+    },
+    "progress": {
+      "validate": "Checking the token and starting the GitHub Copilot runtime. The first run downloads the runtime and can take a minute or two."
+    },
+    "error": {
+      "invalid_auth": "The token was rejected, or it has no access to GitHub Copilot.",
+      "cannot_connect": "Could not reach GitHub or start the Copilot runtime. Check the logs for details.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This GitHub account is already configured.",
+      "reauth_successful": "Re-authentication was successful.",
+      "wrong_account": "The new token belongs to a different GitHub account."
+    }
+  },
+  "config_subentries": {
+    "conversation": {
+      "entry_type": "Conversation agent",
+      "initiate_flow": {
+        "user": "Add conversation agent",
+        "reconfigure": "Reconfigure conversation agent"
+      },
+      "step": {
+        "init": {
+          "title": "Conversation agent",
+          "data": {
+            "name": "Name",
+            "chat_model": "Model",
+            "reasoning_effort": "Reasoning effort",
+            "prompt": "Instructions",
+            "llm_hass_api": "Control Home Assistant"
+          },
+          "data_description": {
+            "chat_model": "Copilot model to use. Premium models consume premium requests from your plan.",
+            "reasoning_effort": "Higher effort can improve quality but is slower. Ignored by models without reasoning support.",
+            "prompt": "Instruct how the assistant should respond. This can be a template.",
+            "llm_hass_api": "Let Copilot control and query entities exposed to Assist."
+          }
+        }
+      },
+      "abort": {
+        "entry_not_loaded": "The GitHub Copilot entry must be loaded first.",
+        "reconfigure_successful": "Reconfiguration was successful."
+      }
+    },
+    "ai_task_data": {
+      "entry_type": "AI task",
+      "initiate_flow": {
+        "user": "Add AI task",
+        "reconfigure": "Reconfigure AI task"
+      },
+      "step": {
+        "init": {
+          "title": "AI task",
+          "data": {
+            "name": "Name",
+            "chat_model": "Model",
+            "reasoning_effort": "Reasoning effort"
+          },
+          "data_description": {
+            "chat_model": "Copilot model to use. Premium models consume premium requests from your plan.",
+            "reasoning_effort": "Higher effort can improve quality but is slower. Ignored by models without reasoning support."
+          }
+        }
+      },
+      "abort": {
+        "entry_not_loaded": "The GitHub Copilot entry must be loaded first.",
+        "reconfigure_successful": "Reconfiguration was successful."
+      }
+    }
+  },
+  "selector": {
+    "reasoning_effort": {
+      "options": {
+        "default": "Model default",
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High"
+      }
+    }
+  },
+  "exceptions": {}
+}
