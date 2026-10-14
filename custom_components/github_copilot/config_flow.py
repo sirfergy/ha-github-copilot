@@ -84,7 +84,8 @@ async def async_validate_token(hass: HomeAssistant, token: str) -> dict[str, Any
             },
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            if resp.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+            # 403 here usually means rate limiting rather than a bad token.
+            if resp.status == HTTPStatus.UNAUTHORIZED:
                 raise InvalidAuth
             resp.raise_for_status()
             user = await resp.json()
@@ -94,16 +95,15 @@ async def async_validate_token(hass: HomeAssistant, token: str) -> dict[str, Any
     runtime = CopilotRuntime(hass, token)
     try:
         await runtime.async_start()
+        default_model = runtime.default_model()
     except CopilotAuthError as err:
         LOGGER.debug("Copilot rejected token: %s", err)
         raise InvalidAuth from err
     except CopilotConnectionError as err:
         LOGGER.warning("Could not start the GitHub Copilot runtime: %s", err)
         raise CannotConnect from err
-    try:
-        default_model = runtime.default_model()
     finally:
-        await runtime.async_stop()
+        await runtime.async_close()
 
     return {
         "user_id": str(user["id"]),

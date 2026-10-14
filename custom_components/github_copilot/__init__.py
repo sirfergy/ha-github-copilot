@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_ACCESS_TOKEN, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.const import CONF_ACCESS_TOKEN, EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
@@ -27,7 +27,7 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: GitHubCopilotConfigEntry
 ) -> bool:
     """Start a Copilot runtime for this account."""
-    runtime = CopilotRuntime(hass, entry.data[CONF_ACCESS_TOKEN])
+    runtime = CopilotRuntime(hass, entry.data[CONF_ACCESS_TOKEN], name=entry.entry_id)
     try:
         await runtime.async_start()
     except CopilotAuthError as err:
@@ -37,6 +37,14 @@ async def async_setup_entry(
 
     entry.runtime_data = runtime
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    async def _async_stop_runtime(event: Event) -> None:
+        # Entries aren't unloaded at shutdown; stop the subprocess explicitly.
+        await runtime.async_close()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_runtime)
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -48,7 +56,7 @@ async def async_unload_entry(
     """Stop the runtime."""
     if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         return False
-    await entry.runtime_data.async_stop()
+    await entry.runtime_data.async_close()
     return True
 
 

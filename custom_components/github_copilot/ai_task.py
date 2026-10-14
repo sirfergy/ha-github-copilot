@@ -79,5 +79,5 @@ def _parse_json(text: str) -> Any:
             return json.loads(candidate)
         except ValueError:
             continue
-    LOGGER.error("GitHub Copilot returned invalid JSON: %s", text)
+    LOGGER.debug("Invalid JSON from GitHub Copilot (truncated): %.500s", text)
     raise HomeAssistantError("GitHub Copilot returned an invalid JSON response")

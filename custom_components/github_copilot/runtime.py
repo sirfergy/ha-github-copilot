@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from functools import partial
 import os
 import shutil
 import tempfile
+from typing import Any
+import uuid
 
 from copilot import CopilotClient
 from copilot.client import ModelInfo
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import FALLBACK_CHAT_MODEL, LOGGER, PREFERRED_CHAT_MODELS
+from .const import DOMAIN, FALLBACK_CHAT_MODEL, LOGGER, PREFERRED_CHAT_MODELS
+
+# Bound how long a hung runtime can delay unload, restart or shutdown.
+STOP_TIMEOUT = 10
 
 
 class CopilotError(HomeAssistantError):
@@ -64,31 +70,84 @@ def _model_enabled(info: ModelInfo) -> bool:
     return info.policy is None or info.policy.state != "disabled"
 
 
+def _is_auth_failure(err: BaseException) -> bool:
+    text = str(err).lower()
+    return any(marker in text for marker in ("401", "403", "unauthorized", "forbidden"))
+
+
 @dataclass
 class CopilotRuntime:
-    """One SDK client (and runtime subprocess) per config entry."""
+    """One SDK client (and runtime subprocess) per config entry.
+
+    Start, restart and close are serialized by one lock, and a closed runtime
+    never starts again, so a request that races an unload can't resurrect it.
+    """
 
     hass: HomeAssistant
     token: str
+    # Stable name (the config entry id) for the scratch directory; None for
+    # throwaway runtimes such as the one used to validate a token.
+    name: str | None = None
     client: CopilotClient | None = None
     models: dict[str, CopilotModel] = field(default_factory=dict)
     _root_dir: str | None = None
-    _restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _closed: bool = False
+    _cleanup_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
-    async def async_restart(self, failed_client: CopilotClient | None) -> None:
-        """Replace a runtime that has died; concurrent callers restart once."""
-        async with self._restart_lock:
-            if self.client is not None and self.client is not failed_client:
-                return
-            LOGGER.warning("Restarting the GitHub Copilot runtime")
-            await self.async_stop()
-            await self.async_start()
+    @callback
+    def async_schedule_cleanup(self, target: Coroutine[Any, Any, None]) -> None:
+        """Run per-request cleanup in the background, tracked for close()."""
+        task = self.hass.async_create_background_task(target, f"{DOMAIN} cleanup")
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
 
     async def async_start(self) -> None:
         """Provision the runtime, start it and verify the token."""
+        async with self._lock:
+            self._raise_if_closed()
+            await self._async_start()
+
+    async def async_restart(self, failed_client: CopilotClient | None) -> None:
+        """Replace a runtime that has died; concurrent callers restart once."""
+        async with self._lock:
+            self._raise_if_closed()
+            if self.client is not None and self.client is not failed_client:
+                return
+            LOGGER.warning("Restarting the GitHub Copilot runtime")
+            await self._async_stop()
+            await self._async_start()
+
+    async def async_close(self) -> None:
+        """Stop for good (entry unload or Home Assistant shutdown)."""
+        self._closed = True
+        # Let in-flight session cleanup finish (each step is bounded) so no
+        # RPC is cancelled mid-flight while the runtime process exits.
+        if self._cleanup_tasks:
+            await asyncio.wait(set(self._cleanup_tasks), timeout=STOP_TIMEOUT)
+        async with self._lock:
+            await self._async_stop_shielded()
+
+    def _raise_if_closed(self) -> None:
+        if self._closed:
+            raise CopilotConnectionError("The GitHub Copilot runtime was stopped")
+
+    async def _async_start(self) -> None:
         try:
-            self._root_dir, home_dir, work_dir = await self.hass.async_add_executor_job(
-                _make_dirs
+            await self._async_launch()
+        except BaseException:
+            # Includes cancellation (e.g. the config flow was closed mid-download).
+            await self._async_stop_shielded()
+            raise
+
+    async def _async_launch(self) -> None:
+        self._root_dir = os.path.join(
+            tempfile.gettempdir(),
+            f"ha-github-copilot-{self.name or uuid.uuid4().hex}",
+        )
+        try:
+            home_dir, work_dir = await self.hass.async_add_executor_job(
+                _make_dirs, self._root_dir
             )
             # Constructing the client resolves (and on first use downloads) the
             # runtime bundle with blocking I/O, so keep it off the event loop.
@@ -105,30 +164,24 @@ class CopilotRuntime:
                 )
             )
             await self.client.start()
+            status = await self.client.get_auth_status()
         except Exception as err:
-            await self.async_stop()
             raise CopilotConnectionError(
                 f"Unable to start the GitHub Copilot runtime: {err}"
             ) from err
-
-        try:
-            status = await self.client.get_auth_status()
-        except Exception as err:
-            await self.async_stop()
-            raise CopilotConnectionError(
-                f"Unable to query GitHub Copilot auth status: {err}"
-            ) from err
         if not status.isAuthenticated:
-            await self.async_stop()
             raise CopilotAuthError(status.statusMessage or "Not authenticated")
 
         try:
             await self.async_refresh_models()
         except Exception as err:
-            await self.async_stop()
             # Listing models is the first call that needs Copilot entitlement.
-            raise CopilotAuthError(
-                f"Token cannot access GitHub Copilot models: {err}"
+            if _is_auth_failure(err):
+                raise CopilotAuthError(
+                    f"Token cannot access GitHub Copilot: {err}"
+                ) from err
+            raise CopilotConnectionError(
+                f"Unable to list GitHub Copilot models: {err}"
             ) from err
 
     async def async_refresh_models(self) -> None:
@@ -148,31 +201,47 @@ class CopilotRuntime:
                 return model_id
         return next(iter(self.models), FALLBACK_CHAT_MODEL)
 
-    async def async_stop(self) -> None:
+    async def _async_stop_shielded(self) -> None:
+        """Stop even if the caller is cancelled while waiting."""
+        # A tracked task, so Home Assistant waits for it during shutdown.
+        await asyncio.shield(
+            self.hass.async_create_task(self._async_stop(), f"{DOMAIN} stop runtime")
+        )
+
+    async def _async_stop(self) -> None:
         """Stop the runtime subprocess and remove its scratch directories."""
         client, self.client = self.client, None
-        if client is not None:
-            try:
-                await client.stop()
-            except Exception:
-                LOGGER.debug("Error stopping Copilot client", exc_info=True)
         root_dir, self._root_dir = self._root_dir, None
-        if root_dir is not None:
-            await self.hass.async_add_executor_job(
-                partial(shutil.rmtree, root_dir, ignore_errors=True)
-            )
+        try:
+            if client is not None:
+                try:
+                    async with asyncio.timeout(STOP_TIMEOUT):
+                        await client.stop()
+                except Exception:
+                    LOGGER.debug("Graceful runtime stop failed", exc_info=True)
+                    try:
+                        await client.force_stop()
+                    except Exception:
+                        LOGGER.debug("Forced runtime stop failed", exc_info=True)
+        finally:
+            if root_dir is not None:
+                await self.hass.async_add_executor_job(
+                    partial(shutil.rmtree, root_dir, ignore_errors=True)
+                )
 
 
-def _make_dirs() -> tuple[str, str, str]:
+def _make_dirs(root: str) -> tuple[str, str]:
     """Create an isolated Copilot home and an empty working directory.
 
     Keeping these out of the Home Assistant config directory means no user
     skills, MCP servers or instruction files are ever discovered, and nothing
-    the runtime writes ends up in backups.
+    the runtime writes ends up in backups. The root is wiped first so anything
+    left behind by a crash or unclean shutdown is removed.
     """
-    root = tempfile.mkdtemp(prefix="ha-github-copilot-")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, mode=0o700)
     home_dir = os.path.join(root, "home")
     work_dir = os.path.join(root, "work")
     os.makedirs(home_dir)
     os.makedirs(work_dir)
-    return root, home_dir, work_dir
+    return home_dir, work_dir

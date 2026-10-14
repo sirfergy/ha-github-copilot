@@ -301,6 +301,7 @@ async def test_runtime_restarts_when_dead(
     await _set_options(hass, mock_config_entry, **{CONF_LLM_HASS_API: []})
     dead = mock_copilot_client(hass)
     dead.create_session_error = RuntimeError("process exited")
+    dead.alive = False
 
     result = await _ask(hass, "hello")
 
@@ -318,7 +319,9 @@ async def test_runtime_restart_failure(
     mock_copilot: type[FakeCopilotClient],
 ) -> None:
     """If the runtime can't come back the user gets a clear error."""
-    mock_copilot_client(hass).create_session_error = RuntimeError("process exited")
+    dead = mock_copilot_client(hass)
+    dead.create_session_error = RuntimeError("process exited")
+    dead.alive = False
 
     def configure(client: FakeCopilotClient) -> None:
         client.start_error = RuntimeError("download failed")
@@ -352,3 +355,88 @@ async def test_unauthorized_starts_reauth(
     assert result.response.response_type is intent.IntentResponseType.ERROR
     flows = hass.config_entries.flow.async_progress()
     assert [flow["context"]["source"] for flow in flows] == ["reauth"]
+
+
+async def test_request_error_does_not_restart_runtime(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+) -> None:
+    """A bad request (e.g. unknown model) fails alone; the runtime survives."""
+    client = mock_copilot_client(hass)
+    client.create_session_error = ValueError("unknown model")
+
+    result = await _ask(hass, "hello")
+
+    assert result.response.response_type is intent.IntentResponseType.ERROR
+    assert "unknown model" in result.response.speech["plain"]["speech"]
+    assert not client.stopped
+    assert mock_copilot_client(hass) is client
+
+
+async def test_idle_before_message_is_ignored(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+) -> None:
+    """A stray idle before our message starts doesn't end the request."""
+    client = mock_copilot_client(hass)
+
+    async def script(session: FakeSession) -> None:
+        session.idle()
+        session.say("real answer")
+        session.idle()
+
+    client.script = script
+    result = await _ask(hass, "hello")
+    assert result.response.speech["plain"]["speech"] == "real answer"
+
+
+async def test_unexpected_tool_error_is_not_sent_to_model(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+    light_tool: LightTool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected exception text stays local."""
+    await _set_options(hass, mock_config_entry, **{CONF_LLM_HASS_API: ["test-api"]})
+    client = mock_copilot_client(hass)
+
+    async def boom(*args: Any) -> llm.ToolResult:
+        raise RuntimeError("secret https://user:pass@example.com")
+
+    monkeypatch.setattr(light_tool, "async_call", boom)
+    results: list[Any] = []
+
+    async def script(session: FakeSession) -> None:
+        results.append(await session.call_tool("TurnOnLight", {"name": "x"}))
+        session.say("failed")
+        session.idle()
+
+    client.script = script
+    await _ask(hass, "turn on x")
+    assert results[0].result_type == "failure"
+    assert "secret" not in results[0].text_result_for_llm
+    assert "failed unexpectedly" in results[0].text_result_for_llm
+
+
+async def test_session_teardown_survives_abort_failure(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+) -> None:
+    """A failing abort still disconnects and deletes the session."""
+    client = mock_copilot_client(hass)
+
+    async def script(session: FakeSession) -> None:
+        session.abort_error = RuntimeError("abort failed")
+        session.error("boom")
+
+    client.script = script
+    await _ask(hass, "hello")
+    await hass.async_block_till_done()
+    session = client.sessions[-1]
+    assert session.aborted
+    assert session.disconnected
+    assert client.deleted == [session.session_id]

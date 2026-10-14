@@ -52,6 +52,8 @@ async def test_user_flow(
     assert result["title"] == "GitHub Copilot (octocat)"
     assert result["data"] == {CONF_ACCESS_TOKEN: TOKEN}
     assert result["result"].unique_id == "42"
+    (_method, _url, _data, headers) = aioclient_mock.mock_calls[0]
+    assert headers["Authorization"] == f"Bearer {TOKEN}"
     subentries = list(result["result"].subentries.values())
     assert [s.subentry_type for s in subentries] == [
         SUBENTRY_CONVERSATION,
@@ -94,6 +96,7 @@ async def test_default_model_falls_back(
     ("status", "authenticated", "start_error", "error"),
     [
         (HTTPStatus.UNAUTHORIZED, True, None, "invalid_auth"),
+        (HTTPStatus.FORBIDDEN, True, None, "cannot_connect"),
         (HTTPStatus.INTERNAL_SERVER_ERROR, True, None, "cannot_connect"),
         (HTTPStatus.OK, False, None, "invalid_auth"),
         (HTTPStatus.OK, True, RuntimeError("no runtime"), "cannot_connect"),

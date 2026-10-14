@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
+
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -63,3 +67,40 @@ async def test_setup_runtime_failure_retries(
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
     assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_runtime_stops_on_shutdown(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+) -> None:
+    """HA doesn't unload entries at shutdown, so the runtime stops on STOP."""
+    root = Path(mock_config_entry.runtime_data._root_dir)
+    assert root.name == f"ha-github-copilot-{mock_config_entry.entry_id}"
+    assert root.is_dir()
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+    await hass.async_block_till_done()
+
+    assert setup_integration.stopped
+    assert not root.exists()
+
+
+async def test_stale_scratch_dir_is_wiped(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_copilot: type[FakeCopilotClient],
+) -> None:
+    """Leftovers from a crash are removed before the runtime starts."""
+    stale = (
+        Path(tempfile.gettempdir()) / f"ha-github-copilot-{mock_config_entry.entry_id}"
+    )
+    (stale / "home" / "session-state").mkdir(parents=True)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert (stale / "home").is_dir()
+    assert not (stale / "home" / "session-state").exists()
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    assert not stale.exists()

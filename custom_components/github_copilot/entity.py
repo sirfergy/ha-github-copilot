@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from functools import partial
 from http import HTTPStatus
@@ -12,6 +12,7 @@ import json
 import mimetypes
 from typing import TYPE_CHECKING, Any
 
+from copilot import CopilotClient
 from copilot.rpc import PermissionDecisionReject
 from copilot.session import CopilotSession
 from copilot.session_events import (
@@ -22,6 +23,7 @@ from copilot.session_events import (
     SessionErrorData,
     SessionEvent,
     SessionIdleData,
+    UserMessageData,
 )
 from copilot.tools import Tool, ToolInvocation, ToolResult
 from homeassistant.components import conversation
@@ -37,9 +39,13 @@ from .const import (
     CONF_REASONING_EFFORT,
     DOMAIN,
     LOGGER,
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS,
     MAX_HISTORY_TOOL_RESULT_CHARS,
+    PING_TIMEOUT,
     REASONING_EFFORT_DEFAULT,
     RECOMMENDED_REASONING_EFFORT,
+    SESSION_CLOSE_TIMEOUT,
 )
 from .runtime import CopilotAuthError, CopilotError, CopilotModel, CopilotRuntime
 from .schema import strict_output_schema, tool_parameters_schema
@@ -68,6 +74,8 @@ class _Run:
 
     queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
     streamed_message_ids: set[str] = field(default_factory=set)
+    # Idle only means "done" once the runtime has picked up our message.
+    started: bool = False
 
     def emit(self, item: _Delta | Exception | object) -> None:
         self.queue.put_nowait(item)
@@ -77,7 +85,10 @@ class _Run:
             # Sub-agent chatter; we never enable sub-agents, but be safe.
             return
         match event.data:
+            case UserMessageData():
+                self.started = True
             case AssistantTurnStartData():
+                self.started = True
                 self.emit({"role": "assistant"})
             case AssistantMessageDeltaData(delta_content=text, message_id=message_id):
                 if text:
@@ -96,7 +107,7 @@ class _Run:
                     else CopilotRequestError
                 )
                 self.emit(error_cls(f"GitHub Copilot error: {message}"))
-            case SessionIdleData(aborted=aborted):
+            case SessionIdleData(aborted=aborted) if self.started:
                 if aborted:
                     self.emit(CopilotRequestError("GitHub Copilot request was aborted"))
                 self.emit(_DONE)
@@ -210,7 +221,7 @@ class GitHubCopilotBaseLLMEntity(Entity):
         ):
             session_options["reasoning_effort"] = effort
 
-        session = await self._async_create_session(session_options)
+        session, session_client = await self._async_create_session(session_options)
 
         completed = False
         try:
@@ -237,21 +248,27 @@ class GitHubCopilotBaseLLMEntity(Entity):
         except Exception as err:
             raise HomeAssistantError(f"GitHub Copilot request failed: {err}") from err
         finally:
-            self.entry.async_create_background_task(
-                self.hass,
-                _async_close_session(self._runtime, session, abort=not completed),
-                f"{DOMAIN} close session {session.session_id}",
+            self._runtime.async_schedule_cleanup(
+                _async_close_session(session_client, session, abort=not completed)
             )
 
-    async def _async_create_session(self, options: dict[str, Any]) -> CopilotSession:
+    async def _async_create_session(
+        self, options: dict[str, Any]
+    ) -> tuple[CopilotSession, CopilotClient]:
         """Create a session, restarting the runtime once if it has died."""
         runtime = self._runtime
         client = runtime.client
         if client is not None:
             try:
-                return await client.create_session(**options)
+                return await client.create_session(**options), client
             except Exception as err:
-                LOGGER.warning("Unable to create a GitHub Copilot session: %s", err)
+                # Only a dead runtime warrants a restart; request errors such
+                # as an unknown model must not disturb other sessions.
+                if await _async_is_alive(client):
+                    raise HomeAssistantError(
+                        f"Unable to start a GitHub Copilot session: {err}"
+                    ) from err
+                LOGGER.warning("The GitHub Copilot runtime stopped responding: %s", err)
         try:
             await runtime.async_restart(client)
         except CopilotAuthError as err:
@@ -263,9 +280,10 @@ class GitHubCopilotBaseLLMEntity(Entity):
             raise HomeAssistantError(
                 f"The GitHub Copilot runtime is not available: {err}"
             ) from err
-        assert runtime.client is not None
+        client = runtime.client
+        assert client is not None
         try:
-            return await runtime.client.create_session(**options)
+            return await client.create_session(**options), client
         except Exception as err:
             raise HomeAssistantError(
                 f"Unable to start a GitHub Copilot session: {err}"
@@ -361,10 +379,15 @@ async def _async_call_tool(
         if str(err):
             data["error_text"] = str(err)
         result = llm.ToolResult(data=data, error=True)
-    except Exception as err:
+    except Exception:
+        # Details may be sensitive; keep them in the local log only.
         LOGGER.exception("Unexpected error calling tool %s", tool_name)
         result = llm.ToolResult(
-            data={"error": type(err).__name__, "error_text": str(err)}, error=True
+            data={
+                "error": "UnexpectedError",
+                "error_text": "The tool failed unexpectedly",
+            },
+            error=True,
         )
     LOGGER.debug("Tool response: %s", result)
     emit(
@@ -395,15 +418,15 @@ async def _async_prepare_attachments(
     """Read attachments into inline base64 blobs, validating model limits."""
     if not attachments:
         return []
-    if model is not None:
-        if not model.vision:
-            raise HomeAssistantError(
-                f"Model {model.id} does not support image attachments"
-            )
-        if model.max_images and len(attachments) > model.max_images:
-            raise HomeAssistantError(
-                f"Model {model.id} accepts at most {model.max_images} attachment(s)"
-            )
+    if model is not None and not model.vision:
+        raise HomeAssistantError(f"Model {model.id} does not support image attachments")
+    # Hard caps apply even to custom model ids without known limits.
+    max_count = min((model and model.max_images) or MAX_ATTACHMENTS, MAX_ATTACHMENTS)
+    if len(attachments) > max_count:
+        raise HomeAssistantError(f"At most {max_count} attachment(s) are supported")
+    max_size = min(
+        (model and model.max_image_size) or MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_BYTES
+    )
 
     def _read() -> list[dict[str, Any]]:
         blobs = []
@@ -425,16 +448,16 @@ async def _async_prepare_attachments(
                 )
             if not attachment.path.is_file():
                 raise HomeAssistantError(f"Attachment {attachment.path} does not exist")
+            # Check the size before reading so huge files never reach memory,
+            # and again afterwards in case the file grew in between.
+            too_large = HomeAssistantError(
+                f"Attachment {attachment.path.name} is larger than {max_size} bytes"
+            )
+            if attachment.path.stat().st_size > max_size:
+                raise too_large
             data = attachment.path.read_bytes()
-            if (
-                model is not None
-                and model.max_image_size
-                and (len(data) > model.max_image_size)
-            ):
-                raise HomeAssistantError(
-                    f"Attachment {attachment.path.name} is larger than "
-                    f"{model.max_image_size} bytes"
-                )
+            if len(data) > max_size:
+                raise too_large
             blobs.append(
                 {
                     "type": "blob",
@@ -449,14 +472,32 @@ async def _async_prepare_attachments(
 
 
 async def _async_close_session(
-    runtime: CopilotRuntime, session: CopilotSession, *, abort: bool
+    client: CopilotClient, session: CopilotSession, *, abort: bool
 ) -> None:
-    """Tear a per-request session down without delaying the response."""
+    """Tear a per-request session down without delaying the response.
+
+    Each step is bounded and attempted independently, so a wedged runtime
+    can't hang this task or skip the remaining cleanup.
+    """
+    if abort:
+        await _async_best_effort("abort", session.abort())
+    await _async_best_effort("disconnect", session.disconnect())
+    await _async_best_effort("delete", client.delete_session(session.session_id))
+
+
+async def _async_best_effort(step: str, operation: Awaitable[Any]) -> None:
     try:
-        if abort:
-            await session.abort()
-        await session.disconnect()
-        if runtime.client is not None:
-            await runtime.client.delete_session(session.session_id)
+        async with asyncio.timeout(SESSION_CLOSE_TIMEOUT):
+            await operation
     except Exception:
-        LOGGER.debug("Error closing Copilot session", exc_info=True)
+        LOGGER.debug("Error during Copilot session %s", step, exc_info=True)
+
+
+async def _async_is_alive(client: CopilotClient) -> bool:
+    """Return whether the runtime still answers."""
+    try:
+        async with asyncio.timeout(PING_TIMEOUT):
+            await client.ping()
+    except Exception:
+        return False
+    return True

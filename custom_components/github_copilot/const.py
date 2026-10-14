@@ -47,5 +47,13 @@ DEFAULT_AI_TASK_OPTIONS: Final = {
 CONVERSATION_TIMEOUT: Final = 120
 AI_TASK_TIMEOUT: Final = 300
 
+# Session teardown and liveness checks must never hang a request or unload.
+SESSION_CLOSE_TIMEOUT: Final = 10
+PING_TIMEOUT: Final = 5
+
+# Hard caps regardless of what the model advertises.
+MAX_ATTACHMENTS: Final = 10
+MAX_ATTACHMENT_BYTES: Final = 20 * 1024 * 1024
+
 # Upper bound on how much of a single prior tool result is replayed as history.
 MAX_HISTORY_TOOL_RESULT_CHARS: Final = 2000

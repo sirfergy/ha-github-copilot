@@ -221,3 +221,32 @@ async def test_error_event(
         await ai_task.async_generate_data(
             hass, task_name="x", entity_id=ENTITY_ID, instructions="hi"
         )
+
+
+async def test_attachment_hard_cap_for_unknown_model(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    setup_integration: FakeCopilotClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom model ids without metadata still get the integration's caps."""
+    monkeypatch.setattr(
+        "custom_components.github_copilot.entity.MAX_ATTACHMENT_BYTES", 10
+    )
+    subentry = next(
+        s
+        for s in mock_config_entry.subentries.values()
+        if s.subentry_type == SUBENTRY_AI_TASK
+    )
+    hass.config_entries.async_update_subentry(
+        mock_config_entry, subentry, data={CONF_CHAT_MODEL: "my-custom-model"}
+    )
+    await hass.async_block_till_done()
+    image = tmp_path / "a.png"
+    image.write_bytes(b"x" * 11)
+    with (
+        patch.object(Path, "read_bytes", side_effect=AssertionError("read")),
+        pytest.raises(HomeAssistantError, match="larger than 10 bytes"),
+    ):
+        await _generate_with_image(hass, image, "image/png")

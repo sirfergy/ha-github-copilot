@@ -31,4 +31,4 @@ known-first-party = ["custom_components.github_copilot"]
 combine-as-imports = true
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["PLR0917"]
+"tests/*" = ["PLR0917", "ASYNC240"]

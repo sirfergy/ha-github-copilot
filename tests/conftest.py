@@ -117,6 +117,7 @@ class FakeSession:
     sent: list[dict[str, Any]] = field(default_factory=list)
     aborted: bool = False
     disconnected: bool = False
+    abort_error: Exception | None = None
 
     def emit(self, data: Any, agent_id: str | None = None) -> None:
         self.options["on_event"](_event(data, agent_id))
@@ -171,6 +172,8 @@ class FakeSession:
 
     async def abort(self) -> None:
         self.aborted = True
+        if self.abort_error:
+            raise self.abort_error
 
     async def disconnect(self) -> None:
         self.disconnected = True
@@ -194,6 +197,11 @@ class FakeCopilotClient:
         self.models = list(MODELS)
         self.start_error: Exception | None = None
         self.create_session_error: Exception | None = None
+        self.list_models_error: Exception | None = None
+        self.alive = True
+        self.start_gate: asyncio.Event | None = None
+        self.stop_hangs = False
+        self.force_stopped = False
         self.sessions: list[FakeSession] = []
         self.deleted: list[str] = []
         self.tasks: list[asyncio.Task] = []
@@ -205,12 +213,23 @@ class FakeCopilotClient:
     configure: ClassVar[Callable[[FakeCopilotClient], None] | None] = None
 
     async def start(self) -> None:
+        if self.start_gate:
+            await self.start_gate.wait()
         if self.start_error:
             raise self.start_error
         self.started = True
 
     async def stop(self) -> None:
+        if self.stop_hangs:
+            await asyncio.Event().wait()
         self.stopped = True
+
+    async def force_stop(self) -> None:
+        self.force_stopped = True
+
+    async def ping(self) -> None:
+        if not self.alive:
+            raise ConnectionError("runtime exited")
 
     async def get_auth_status(self) -> GetAuthStatusResponse:
         return GetAuthStatusResponse(
@@ -218,6 +237,8 @@ class FakeCopilotClient:
         )
 
     async def list_models(self) -> list[ModelInfo]:
+        if self.list_models_error:
+            raise self.list_models_error
         return self.models
 
     async def create_session(self, **options: Any) -> FakeSession:
