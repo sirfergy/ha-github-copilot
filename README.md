@@ -22,7 +22,7 @@ It's built on the official [GitHub Copilot SDK](https://github.com/github/copilo
 ### HACS
 
 1. In HACS, open the menu and choose **Custom repositories**.
-2. Add `https://github.com/obvioussean/ha-github-copilot` as an **Integration**.
+2. Add `https://github.com/sirfergy/ha-github-copilot` as an **Integration**.
 3. Install **GitHub Copilot** and restart Home Assistant.
 
 ### Manual

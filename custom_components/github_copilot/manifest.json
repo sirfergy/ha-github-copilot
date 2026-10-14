@@ -2,13 +2,13 @@
   "domain": "github_copilot",
   "name": "GitHub Copilot",
   "after_dependencies": ["assist_pipeline", "intent"],
-  "codeowners": ["@obvioussean"],
+  "codeowners": ["@sirfergy"],
   "config_flow": true,
   "dependencies": ["ai_task", "conversation"],
-  "documentation": "https://github.com/obvioussean/ha-github-copilot",
+  "documentation": "https://github.com/sirfergy/ha-github-copilot",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/obvioussean/ha-github-copilot/issues",
+  "issue_tracker": "https://github.com/sirfergy/ha-github-copilot/issues",
   "requirements": ["github-copilot-sdk==1.0.22"],
   "version": "0.1.0"
 }
