@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+import contextlib
+import copy
 from dataclasses import dataclass, field
 from functools import partial
 import os
@@ -17,7 +19,14 @@ from copilot.client import ModelInfo
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN, FALLBACK_CHAT_MODEL, LOGGER, PREFERRED_CHAT_MODELS
+from .const import (
+    DOMAIN,
+    FALLBACK_CHAT_MODEL,
+    IMAGE_SESSION_OPTIONS,
+    IMAGE_TOOL,
+    LOGGER,
+    PREFERRED_CHAT_MODELS,
+)
 
 # Bound how long a hung runtime can delay unload, restart or shutdown.
 STOP_TIMEOUT = 10
@@ -90,6 +99,7 @@ class CopilotRuntime:
     name: str | None = None
     client: CopilotClient | None = None
     models: dict[str, CopilotModel] = field(default_factory=dict)
+    image_generation_available: bool = False
     _root_dir: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _closed: bool = False
@@ -159,13 +169,16 @@ class CopilotRuntime:
             raise
 
     async def _async_launch(self) -> None:
+        # Every start gets its own directory, so a stop that is still
+        # cleaning up can never race a new start on the same path.
+        prefix = f"ha-github-copilot-{self.name}-" if self.name else None
         self._root_dir = os.path.join(
             tempfile.gettempdir(),
-            f"ha-github-copilot-{self.name or uuid.uuid4().hex}",
+            f"{prefix or 'ha-github-copilot-'}{uuid.uuid4().hex[:12]}",
         )
         try:
             home_dir, work_dir = await self.hass.async_add_executor_job(
-                _make_dirs, self._root_dir
+                _make_dirs, self._root_dir, prefix
             )
             # Constructing the client resolves (and on first use downloads) the
             # runtime bundle with blocking I/O, so keep it off the event loop.
@@ -201,6 +214,39 @@ class CopilotRuntime:
             raise CopilotConnectionError(
                 f"Unable to list GitHub Copilot models: {err}"
             ) from err
+
+        self.image_generation_available = await self._async_probe_image_generation()
+
+    async def _async_probe_image_generation(self) -> bool:
+        """Check whether this account is offered Copilot's image tool.
+
+        GitHub gates the (experimental) tool per account, so look at what a
+        session actually exposes; this makes no model request.
+        """
+        assert self.client is not None
+        try:
+            session = await self.client.create_session(
+                **copy.deepcopy(IMAGE_SESSION_OPTIONS),
+                tools=[],
+                infinite_sessions={"enabled": False},
+            )
+        except Exception:
+            LOGGER.debug("Image generation probe failed", exc_info=True)
+            return False
+        try:
+            await session.rpc.tools.initialize_and_validate()
+            metadata = await session.rpc.tools.get_current_metadata()
+            available = any(tool.name == IMAGE_TOOL for tool in metadata.tools)
+        except Exception:
+            LOGGER.debug("Image generation probe failed", exc_info=True)
+            available = False
+        finally:
+            with contextlib.suppress(Exception):
+                await session.disconnect()
+            with contextlib.suppress(Exception):
+                await self.client.delete_session(session.session_id)
+        LOGGER.debug("GitHub Copilot image generation available: %s", available)
+        return available
 
     async def async_refresh_models(self) -> None:
         """Refresh the cached model list."""
@@ -244,23 +290,32 @@ class CopilotRuntime:
                         LOGGER.debug("Forced runtime stop failed", exc_info=True)
         finally:
             if root_dir is not None:
-                await self.hass.async_add_executor_job(
-                    partial(shutil.rmtree, root_dir, ignore_errors=True)
-                )
+                await self.hass.async_add_executor_job(_rmtree, root_dir)
 
 
-def _make_dirs(root: str) -> tuple[str, str]:
+def _make_dirs(root: str, stale_prefix: str | None) -> tuple[str, str]:
     """Create an isolated Copilot home and an empty working directory.
 
     Keeping these out of the Home Assistant config directory means no user
     skills, MCP servers or instruction files are ever discovered, and nothing
-    the runtime writes ends up in backups. The root is wiped first so anything
-    left behind by a crash or unclean shutdown is removed.
+    the runtime writes ends up in backups. Directories an earlier run of the
+    same entry left behind (crash, unclean shutdown) are removed first.
     """
-    shutil.rmtree(root, ignore_errors=True)
+    if stale_prefix:
+        parent = os.path.dirname(root)
+        for entry in os.scandir(parent):
+            if entry.name.startswith(stale_prefix) and entry.is_dir():
+                _rmtree(entry.path)
     os.makedirs(root, mode=0o700)
     home_dir = os.path.join(root, "home")
     work_dir = os.path.join(root, "work")
     os.makedirs(home_dir)
     os.makedirs(work_dir)
     return home_dir, work_dir
+
+
+def _rmtree(path: str) -> None:
+    def _log(function: Any, failed_path: str, exc: BaseException) -> None:
+        LOGGER.debug("Unable to remove %s: %s", failed_path, exc)
+
+    shutil.rmtree(path, onexc=_log)

@@ -248,3 +248,69 @@ async def test_live_unknown_model_refused(
             entity_id="ai_task.copilot_task",
             instructions="hi",
         )
+
+
+async def _live_image(hass: HomeAssistant, instructions: str, attachments=None):
+    with patch.object(
+        media_source.local_source.LocalSource,
+        "async_upload_media",
+        return_value="media-source://ai_task/image/live.png",
+    ) as upload:
+        result = await ai_task.async_generate_image(
+            hass,
+            task_name="live image",
+            entity_id="ai_task.copilot_task",
+            instructions=instructions,
+            attachments=attachments,
+        )
+    return result, upload.call_args[0][1].file.getvalue()
+
+
+async def test_live_generate_image(
+    hass: HomeAssistant, live_entry: MockConfigEntry
+) -> None:
+    """Copilot's image tool produces a real image."""
+    import time
+
+    assert live_entry.runtime_data.image_generation_available
+    started = time.monotonic()
+    result, data = await _live_image(hass, "A small red house on a green hill.")
+    print(
+        "IMAGE:",
+        result["mime_type"],
+        result["width"],
+        result["height"],
+        len(data),
+        "bytes in",
+        round(time.monotonic() - started, 1),
+        "s; revised:",
+        (result["revised_prompt"] or "")[:80],
+    )
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert result["width"] and result["height"]
+
+
+async def test_live_generate_image_from_attachment(
+    hass: HomeAssistant, live_entry: MockConfigEntry, tmp_path: Path
+) -> None:
+    """An attached image can be used as the reference."""
+    image = tmp_path / "ref.png"
+    image.write_bytes(_png((20, 20, 220)))
+    with patch(
+        "homeassistant.components.media_source.async_resolve_media",
+        return_value=media_source.PlayMedia(
+            url="/x", mime_type="image/png", path=image
+        ),
+    ):
+        result, data = await _live_image(
+            hass,
+            "Turn the attached blue square into a blue circle on white.",
+            attachments=[
+                {
+                    "media_content_id": "media-source://media_source/local/ref.png",
+                    "media_content_type": "image/png",
+                }
+            ],
+        )
+    print("EDIT:", result["width"], result["height"], len(data), "bytes")
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"

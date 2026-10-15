@@ -31,7 +31,10 @@ async def _submit_token(hass: HomeAssistant, flow_id: str, token: str = TOKEN):
     )
     assert result["type"] is FlowResultType.SHOW_PROGRESS
     await hass.async_block_till_done()
-    return await hass.config_entries.flow.async_configure(flow_id)
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    # Let a newly created entry finish setting up before the test ends.
+    await hass.async_block_till_done()
+    return result
 
 
 async def test_user_flow(

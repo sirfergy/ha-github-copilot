@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import patch
 import uuid
@@ -23,9 +25,14 @@ from copilot.session_events import (
     AssistantMessageDeltaData,
     AssistantReasoningDeltaData,
     AssistantTurnStartData,
+    PermissionRequestCustomTool,
     SessionErrorData,
     SessionEvent,
     SessionIdleData,
+    ToolExecutionCompleteContentImage,
+    ToolExecutionCompleteData,
+    ToolExecutionCompleteResult,
+    ToolExecutionStartData,
 )
 from copilot.tools import ToolInvocation
 from homeassistant.const import CONF_ACCESS_TOKEN
@@ -116,9 +123,73 @@ class FakeSession:
     options: dict[str, Any]
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     sent: list[dict[str, Any]] = field(default_factory=list)
+    permission_decisions: list[str] = field(default_factory=list)
     aborted: bool = False
     disconnected: bool = False
     abort_error: Exception | None = None
+
+    @property
+    def rpc(self) -> Any:
+        """The subset of session RPCs used by the image tool probe."""
+        tools = (
+            [SimpleNamespace(name="image_generation")]
+            if (
+                self.client.image_tool_available
+                and "builtin:image_generation" in self.options["available_tools"]
+            )
+            else []
+        )
+
+        async def initialize_and_validate() -> None:
+            return None
+
+        async def get_current_metadata() -> Any:
+            return SimpleNamespace(tools=tools)
+
+        return SimpleNamespace(
+            tools=SimpleNamespace(
+                initialize_and_validate=initialize_and_validate,
+                get_current_metadata=get_current_metadata,
+            )
+        )
+
+    async def generate_image(
+        self,
+        data: bytes,
+        *,
+        prompt: str = "a detailed prompt",
+        mime_type: str = "image/png",
+    ) -> None:
+        """Emit the events Copilot's image tool produces."""
+        call_id = f"call_image_{len(data)}"
+        self.emit(
+            ToolExecutionStartData(
+                tool_call_id=call_id,
+                tool_name="image_generation",
+                arguments={"prompt": prompt},
+            )
+        )
+        decision = self.options["on_permission_request"](
+            PermissionRequestCustomTool(
+                tool_description="Generate an image", tool_name="image_generation"
+            ),
+            {"session_id": self.session_id},
+        )
+        self.permission_decisions.append(type(decision).__name__)
+        self.emit(
+            ToolExecutionCompleteData(
+                success=True,
+                tool_call_id=call_id,
+                result=ToolExecutionCompleteResult(
+                    content="Image generated successfully.",
+                    contents=[
+                        ToolExecutionCompleteContentImage(
+                            data=base64.b64encode(data).decode(), mime_type=mime_type
+                        )
+                    ],
+                ),
+            )
+        )
 
     def emit(self, data: Any, agent_id: str | None = None) -> None:
         self.options["on_event"](_event(data, agent_id))
@@ -203,8 +274,10 @@ class FakeCopilotClient:
         self.start_gate: asyncio.Event | None = None
         self.stop_hangs = False
         self.force_stopped = False
+        self.image_tool_available = False
         self.sessions: list[FakeSession] = []
         self.deleted: list[str] = []
+        self.probes: list[str] = []
         self.tasks: list[asyncio.Task] = []
         self.script: Script = _default_script
         FakeCopilotClient.instances.append(self)
@@ -246,11 +319,17 @@ class FakeCopilotClient:
         if self.create_session_error:
             raise self.create_session_error
         session = FakeSession(self, options)
-        self.sessions.append(session)
+        # The runtime's start-up image tool probe has no event handler; keep
+        # it out of the sessions tests assert on.
+        if "on_event" in options:
+            self.sessions.append(session)
+        else:
+            self.probes.append(session.session_id)
         return session
 
     async def delete_session(self, session_id: str) -> None:
-        self.deleted.append(session_id)
+        if session_id not in self.probes:
+            self.deleted.append(session_id)
 
 
 @pytest.fixture

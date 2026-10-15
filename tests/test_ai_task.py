@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 from unittest.mock import patch
 
+from copilot.session_events import UserMessageData
 from homeassistant.components import ai_task, media_source
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -291,3 +293,132 @@ async def test_unknown_model_is_refused(
     )
     assert result.data == "ok"
     assert _client().sessions[-1].options["model"] == "not-a-real-model"
+
+
+def _png(width: int, height: int) -> bytes:
+    header = struct.pack(">II", width, height) + b"\x08\x02\x00\x00\x00"
+    return b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR" + header + b"rest"
+
+
+@pytest.fixture
+def image_tool(mock_copilot: type[FakeCopilotClient]) -> None:
+    """Offer Copilot's image tool to the account."""
+
+    def configure(client: FakeCopilotClient) -> None:
+        client.image_tool_available = True
+
+    mock_copilot.configure = configure
+
+
+async def _generate_image(hass: HomeAssistant, instructions: str = "a cabin"):
+    with patch.object(
+        media_source.local_source.LocalSource,
+        "async_upload_media",
+        return_value="media-source://ai_task/image/test.png",
+    ) as upload:
+        result = await ai_task.async_generate_image(
+            hass, task_name="cabin", entity_id=ENTITY_ID, instructions=instructions
+        )
+    return result, upload
+
+
+async def test_image_feature_requires_account_access(
+    hass: HomeAssistant, setup_integration: FakeCopilotClient
+) -> None:
+    """Without the image tool the entity doesn't advertise image generation."""
+    features = hass.states.get(ENTITY_ID).attributes["supported_features"]
+    assert not features & ai_task.AITaskEntityFeature.GENERATE_IMAGE
+    with pytest.raises(HomeAssistantError, match="does not support generating"):
+        await _generate_image(hass)
+
+
+async def test_generate_image(
+    hass: HomeAssistant, image_tool: None, setup_integration: FakeCopilotClient
+) -> None:
+    """Images from Copilot's image tool are returned and stored by HA."""
+    features = hass.states.get(ENTITY_ID).attributes["supported_features"]
+    assert features & ai_task.AITaskEntityFeature.GENERATE_IMAGE
+    png = _png(1536, 1024)
+
+    async def script(session: FakeSession) -> None:
+        session.emit(UserMessageData(content="x"))
+        await session.generate_image(png, prompt="A cozy cabin at dusk, snow")
+        # Copilot would continue with a chat turn; we abort instead.
+
+    _client().script = script
+    result, upload = await _generate_image(hass)
+
+    assert result["mime_type"] == "image/png"
+    assert (result["width"], result["height"]) == (1536, 1024)
+    assert result["revised_prompt"] == "A cozy cabin at dusk, snow"
+    assert upload.call_args[0][1].file.getvalue() == png
+
+    session = _client().sessions[-1]
+    assert session.options["available_tools"] == ["builtin:image_generation"]
+    assert session.options["image_generation"] == {"enabled": True}
+    assert session.options["feature_flags"] == {"IMAGE_GENERATION_TOOL": True}
+    assert session.options["tools"] == []
+    assert session.permission_decisions == ["PermissionDecisionApproveOnce"]
+    assert "image_generation tool" in session.options["system_message"]["content"]
+    await hass.async_block_till_done()
+    # The follow-up chat turn is skipped.
+    assert session.aborted
+
+
+async def test_image_session_denies_other_permissions(
+    hass: HomeAssistant, image_tool: None, setup_integration: FakeCopilotClient
+) -> None:
+    """Only the image tool is approved in image sessions."""
+    from copilot.session_events import PermissionRequestCustomTool
+
+    async def script(session: FakeSession) -> None:
+        decision = session.options["on_permission_request"](
+            PermissionRequestCustomTool(tool_description="x", tool_name="bash"), {}
+        )
+        session.permission_decisions.append(type(decision).__name__)
+        session.say("no")
+        session.idle()
+
+    _client().script = script
+    with pytest.raises(HomeAssistantError):
+        await _generate_image(hass)
+    assert _client().sessions[-1].permission_decisions == ["PermissionDecisionReject"]
+
+
+async def test_generate_image_refused(
+    hass: HomeAssistant, image_tool: None, setup_integration: FakeCopilotClient
+) -> None:
+    """If the model declines, its explanation is surfaced."""
+    _client().script = _reply("I can't create that image.")
+    with pytest.raises(HomeAssistantError, match="I can't create that image"):
+        await _generate_image(hass)
+
+
+async def test_generate_image_tool_failure(
+    hass: HomeAssistant, image_tool: None, setup_integration: FakeCopilotClient
+) -> None:
+    """A failed image tool call is reported."""
+    from copilot.session_events import (
+        ToolExecutionCompleteData,
+        ToolExecutionCompleteError,
+        ToolExecutionStartData,
+    )
+
+    async def script(session: FakeSession) -> None:
+        session.emit(UserMessageData(content="x"))
+        session.emit(
+            ToolExecutionStartData(
+                tool_call_id="c1", tool_name="image_generation", arguments={}
+            )
+        )
+        session.emit(
+            ToolExecutionCompleteData(
+                success=False,
+                tool_call_id="c1",
+                error=ToolExecutionCompleteError(message="content policy"),
+            )
+        )
+
+    _client().script = script
+    with pytest.raises(HomeAssistantError, match="content policy"):
+        await _generate_image(hass)

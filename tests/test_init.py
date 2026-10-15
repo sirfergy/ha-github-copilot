@@ -76,7 +76,7 @@ async def test_runtime_stops_on_shutdown(
 ) -> None:
     """HA doesn't unload entries at shutdown, so the runtime stops on STOP."""
     root = Path(mock_config_entry.runtime_data._root_dir)
-    assert root.name == f"ha-github-copilot-{mock_config_entry.entry_id}"
+    assert root.name.startswith(f"ha-github-copilot-{mock_config_entry.entry_id}-")
     assert root.is_dir()
 
     hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
@@ -86,21 +86,25 @@ async def test_runtime_stops_on_shutdown(
     assert not root.exists()
 
 
-async def test_stale_scratch_dir_is_wiped(
+async def test_stale_scratch_dirs_are_wiped(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_copilot: type[FakeCopilotClient],
 ) -> None:
     """Leftovers from a crash are removed before the runtime starts."""
-    stale = (
-        Path(tempfile.gettempdir()) / f"ha-github-copilot-{mock_config_entry.entry_id}"
-    )
+    tmp = Path(tempfile.gettempdir())
+    stale = tmp / f"ha-github-copilot-{mock_config_entry.entry_id}-deadbeef"
     (stale / "home" / "session-state").mkdir(parents=True)
+    other = tmp / "ha-github-copilot-other-entry-cafebabe"
+    other.mkdir()
 
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    assert (stale / "home").is_dir()
-    assert not (stale / "home" / "session-state").exists()
-    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
     assert not stale.exists()
+    assert other.exists()  # other entries' directories are left alone
+    root = Path(mock_config_entry.runtime_data._root_dir)
+    assert (root / "home").is_dir()
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    assert not root.exists()
+    other.rmdir()

@@ -47,6 +47,25 @@ DEFAULT_AI_TASK_OPTIONS: Final = {
 CONVERSATION_TIMEOUT: Final = 120
 AI_TASK_TIMEOUT: Final = 300
 
+# Copilot's built-in (experimental) image tool and the session options that
+# enable it. Only this tool is allow-listed in image sessions.
+IMAGE_TOOL: Final = "image_generation"
+IMAGE_SESSION_OPTIONS: Final = {
+    "image_generation": {"enabled": True},
+    "feature_flags": {"IMAGE_GENERATION_TOOL": True},
+    "available_tools": [f"builtin:{IMAGE_TOOL}"],
+}
+IMAGE_INSTRUCTIONS: Final = (
+    "Create the requested image by calling the image_generation tool exactly "
+    "once with a detailed prompt. Don't ask follow-up questions."
+)
+IMAGE_TIMEOUT: Final = 300
+
+RUNTIME_STOPPED_MESSAGE: Final = (
+    "The GitHub Copilot runtime stopped (the integration was reloaded or Home "
+    "Assistant is shutting down)"
+)
+
 # Session teardown and liveness checks must never hang a request or unload.
 SESSION_CLOSE_TIMEOUT: Final = 10
 PING_TIMEOUT: Final = 5

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Awaitable, Callable
+import copy
 from dataclasses import dataclass, field
 from functools import partial
 from http import HTTPStatus
@@ -13,7 +14,7 @@ import mimetypes
 from typing import TYPE_CHECKING, Any
 
 from copilot import CopilotClient
-from copilot.rpc import PermissionDecisionReject
+from copilot.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 from copilot.session import CopilotSession
 from copilot.session_events import (
     AssistantMessageData,
@@ -23,6 +24,9 @@ from copilot.session_events import (
     SessionErrorData,
     SessionEvent,
     SessionIdleData,
+    ToolExecutionCompleteContentImage,
+    ToolExecutionCompleteData,
+    ToolExecutionStartData,
     UserMessageData,
 )
 from copilot.tools import Tool, ToolInvocation, ToolResult
@@ -38,6 +42,9 @@ from .const import (
     CONF_CHAT_MODEL,
     CONF_REASONING_EFFORT,
     DOMAIN,
+    IMAGE_INSTRUCTIONS,
+    IMAGE_SESSION_OPTIONS,
+    IMAGE_TOOL,
     LOGGER,
     MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENTS,
@@ -45,6 +52,7 @@ from .const import (
     PING_TIMEOUT,
     REASONING_EFFORT_DEFAULT,
     RECOMMENDED_REASONING_EFFORT,
+    RUNTIME_STOPPED_MESSAGE,
     SESSION_CLOSE_TIMEOUT,
 )
 from .runtime import CopilotAuthError, CopilotError, CopilotModel, CopilotRuntime
@@ -100,13 +108,8 @@ class _Run:
             case AssistantMessageData(content=text, message_id=message_id):
                 if text and message_id not in self.streamed_message_ids:
                     self.emit({"content": text})
-            case SessionErrorData(message=message, status_code=status_code):
-                error_cls = (
-                    CopilotAuthRequestError
-                    if status_code == HTTPStatus.UNAUTHORIZED
-                    else CopilotRequestError
-                )
-                self.emit(error_cls(f"GitHub Copilot error: {message}"))
+            case SessionErrorData() as error:
+                self.emit(_session_error(error))
             case SessionIdleData(aborted=aborted) if self.started:
                 if aborted:
                     self.emit(CopilotRequestError("GitHub Copilot request was aborted"))
@@ -120,6 +123,70 @@ class _Run:
             if isinstance(item, Exception):
                 raise item
             yield item
+
+
+@dataclass
+class _ImageRun:
+    """Waits for the first image produced by Copilot's image tool."""
+
+    result: asyncio.Future[tuple[ToolExecutionCompleteContentImage, str | None]]
+    prompts: dict[str, str | None] = field(default_factory=dict)
+    last_message: str | None = None
+    started: bool = False
+
+    def fail(self, err: Exception) -> None:
+        if not self.result.done():
+            self.result.set_exception(err)
+
+    def discard(self) -> None:
+        """Mark an unused outcome as handled so asyncio doesn't warn about it."""
+        if not self.result.done():
+            self.result.cancel()
+        elif not self.result.cancelled():
+            self.result.exception()
+
+    def on_event(self, event: SessionEvent) -> None:
+        if event.agent_id or self.result.done():
+            return
+        match event.data:
+            case UserMessageData() | AssistantTurnStartData():
+                self.started = True
+            case AssistantMessageData(content=text) if text:
+                self.last_message = text
+            case ToolExecutionStartData(
+                tool_name=name, tool_call_id=call_id, arguments=args
+            ) if name == IMAGE_TOOL:
+                self.prompts[call_id] = (
+                    args.get("prompt") if isinstance(args, dict) else None
+                )
+            case ToolExecutionCompleteData(
+                tool_call_id=call_id, success=success, result=result, error=error
+            ) if call_id in self.prompts:
+                images = [
+                    content
+                    for content in ((result.contents if result else None) or ())
+                    if isinstance(content, ToolExecutionCompleteContentImage)
+                ]
+                if success and images:
+                    self.result.set_result((images[0], self.prompts[call_id]))
+                else:
+                    reason = error.message if error else "no image was returned"
+                    self.fail(HomeAssistantError(f"Image generation failed: {reason}"))
+            case SessionErrorData() as error:
+                self.fail(_session_error(error))
+            case SessionIdleData() if self.started:
+                reason = f": {self.last_message}" if self.last_message else ""
+                self.fail(
+                    HomeAssistantError(
+                        f"GitHub Copilot did not create an image{reason}"
+                    )
+                )
+
+
+def _session_error(error: SessionErrorData) -> CopilotRequestError:
+    if error.status_code == HTTPStatus.UNAUTHORIZED:
+        return CopilotAuthRequestError(f"GitHub Copilot error: {error.message}")
+    return CopilotRequestError(f"GitHub Copilot error: {error.message}")
 
 
 class GitHubCopilotBaseLLMEntity(Entity):
@@ -162,17 +229,10 @@ class GitHubCopilotBaseLLMEntity(Entity):
         structure: probatio.Schema | None = None,
     ) -> None:
         """Send the chat log to Copilot and stream the reply back into it."""
-        system = chat_log.content[0]
-        if not isinstance(system, conversation.SystemContent):
-            raise HomeAssistantError("Chat log is missing its system prompt")
-        user_index = _last_user_index(chat_log.content)
-        user_content = chat_log.content[user_index]
-        assert isinstance(user_content, conversation.UserContent)
-
+        system, user_content, prompt = _split_chat_log(chat_log)
         model_id = self._model_id
         model = await self._async_get_model(model_id)
 
-        prompt = _build_prompt(chat_log.content[1:user_index], user_content.content)
         response_schema: dict[str, Any] | None = None
         if structure is not None:
             response_schema = strict_output_schema(
@@ -211,25 +271,11 @@ class GitHubCopilotBaseLLMEntity(Entity):
             "on_permission_request": _reject_permission,
             "on_event": run.on_event,
         }
-        effort = self.subentry.data.get(
-            CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
-        )
-        if (
-            effort != REASONING_EFFORT_DEFAULT
-            and model is not None
-            and effort in model.reasoning_efforts
-        ):
-            session_options["reasoning_effort"] = effort
+        session_options.update(self._reasoning_options(model))
 
         session, session_client = await self._async_create_session(session_options)
         unsubscribe_stop = self._runtime.async_on_stop(
-            partial(
-                run.emit,
-                CopilotRequestError(
-                    "The GitHub Copilot runtime stopped (the integration was "
-                    "reloaded or Home Assistant is shutting down)"
-                ),
-            )
+            partial(run.emit, CopilotRequestError(RUNTIME_STOPPED_MESSAGE))
         )
 
         completed = False
@@ -261,6 +307,82 @@ class GitHubCopilotBaseLLMEntity(Entity):
             self._runtime.async_schedule_cleanup(
                 _async_close_session(session_client, session, abort=not completed)
             )
+
+    async def _async_generate_image_from_chat_log(
+        self, chat_log: conversation.ChatLog, *, request_timeout: float
+    ) -> tuple[bytes, str, str | None]:
+        """Have Copilot's image tool draw the request.
+
+        Returns the image bytes, MIME type and the prompt the model actually
+        sent to the image tool.
+        """
+        if not self._runtime.image_generation_available:
+            raise HomeAssistantError(
+                "GitHub Copilot image generation isn't available for this account"
+            )
+        system, user_content, prompt = _split_chat_log(chat_log)
+        model_id = self._model_id
+        model = await self._async_get_model(model_id)
+        attachments = await _async_prepare_attachments(
+            self.hass, model, user_content.attachments
+        )
+
+        run = _ImageRun(self.hass.loop.create_future())
+        session_options: dict[str, Any] = {
+            **copy.deepcopy(IMAGE_SESSION_OPTIONS),
+            "model": model_id,
+            "tools": [],
+            "system_message": {
+                "mode": "replace",
+                "content": f"{system.content}\n\n{IMAGE_INSTRUCTIONS}",
+            },
+            "streaming": False,
+            "infinite_sessions": {"enabled": False},
+            "on_permission_request": _approve_image_tool_only,
+            "on_event": run.on_event,
+            **self._reasoning_options(model),
+        }
+        session, session_client = await self._async_create_session(session_options)
+        unsubscribe_stop = self._runtime.async_on_stop(
+            partial(run.fail, CopilotRequestError(RUNTIME_STOPPED_MESSAGE))
+        )
+        try:
+            async with asyncio.timeout(request_timeout):
+                await session.send(prompt, attachments=attachments or None)
+                image, revised_prompt = await asyncio.shield(run.result)
+        except TimeoutError as err:
+            raise HomeAssistantError(
+                f"GitHub Copilot did not create an image within "
+                f"{request_timeout} seconds"
+            ) from err
+        except CopilotAuthRequestError:
+            self.entry.async_start_reauth(self.hass)
+            raise
+        except HomeAssistantError:
+            raise
+        except Exception as err:
+            raise HomeAssistantError(
+                f"GitHub Copilot image request failed: {err}"
+            ) from err
+        finally:
+            unsubscribe_stop()
+            run.discard()
+            # Always abort: once the image exists the model's follow-up chat
+            # turn only adds latency and cost.
+            self._runtime.async_schedule_cleanup(
+                _async_close_session(session_client, session, abort=True)
+            )
+
+        data = await self.hass.async_add_executor_job(base64.b64decode, image.data)
+        return data, image.mime_type or "image/png", revised_prompt
+
+    def _reasoning_options(self, model: CopilotModel) -> dict[str, Any]:
+        effort = self.subentry.data.get(
+            CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
+        )
+        if effort != REASONING_EFFORT_DEFAULT and effort in model.reasoning_efforts:
+            return {"reasoning_effort": effort}
+        return {}
 
     async def _async_get_model(self, model_id: str) -> CopilotModel:
         """Return metadata for the configured model, refusing unknown ids.
@@ -318,6 +440,20 @@ class GitHubCopilotBaseLLMEntity(Entity):
             raise HomeAssistantError(
                 f"Unable to start a GitHub Copilot session: {err}"
             ) from err
+
+
+def _split_chat_log(
+    chat_log: conversation.ChatLog,
+) -> tuple[conversation.SystemContent, conversation.UserContent, str]:
+    """Return the system prompt, latest user message and the prompt to send."""
+    system = chat_log.content[0]
+    if not isinstance(system, conversation.SystemContent):
+        raise HomeAssistantError("Chat log is missing its system prompt")
+    user_index = _last_user_index(chat_log.content)
+    user_content = chat_log.content[user_index]
+    assert isinstance(user_content, conversation.UserContent)
+    prompt = _build_prompt(chat_log.content[1:user_index], user_content.content)
+    return system, user_content, prompt
 
 
 def _last_user_index(content: list[conversation.Content]) -> int:
@@ -432,6 +568,15 @@ async def _async_call_tool(
         text_result_for_llm=json.dumps(result.data, default=str, ensure_ascii=False),
         result_type="failure" if result.error else "success",
     )
+
+
+def _approve_image_tool_only(
+    request: Any, invocation: Any
+) -> PermissionDecisionApproveOnce | PermissionDecisionReject:
+    """Allow Copilot's image tool in image sessions; deny everything else."""
+    if getattr(request, "tool_name", None) == IMAGE_TOOL:
+        return PermissionDecisionApproveOnce()
+    return _reject_permission(request, invocation)
 
 
 def _reject_permission(request: Any, invocation: Any) -> PermissionDecisionReject:

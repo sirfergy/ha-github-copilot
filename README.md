@@ -4,6 +4,7 @@ Use your **GitHub Copilot** subscription as an LLM provider in Home Assistant:
 
 - **Conversation agent** for Assist: chat or talk to Copilot and let it control the entities you expose to Assist.
 - **AI Task** entity for automations: `ai_task.generate_data` with free text or structured output, including camera snapshots and other image attachments.
+- **Image generation**: `ai_task.generate_image` uses Copilot's image tool, and can take reference images such as a camera snapshot.
 
 It's built on the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk). You can pick any model your Copilot plan offers (GPT, Claude, Gemini, …) separately for each agent or task.
 
@@ -88,6 +89,25 @@ template:
         state: "{{ result.data.chickens }}"
 ```
 
+Generate an image. It is saved to the media library, and the response includes a `url`:
+
+```yaml
+- action: ai_task.generate_image
+  data:
+    task_name: weather art
+    entity_id: ai_task.github_copilot_ai_task
+    instructions: >-
+      A watercolor of our street when the weather is {{ states("weather.home") }}
+  response_variable: image
+- action: notify.mobile_app_phone
+  data:
+    message: Today's weather art
+    data:
+      image: "{{ image.url }}"
+```
+
+Image generation is an experimental Copilot feature that GitHub enables per account. If your account doesn't have it, the AI Task entity simply doesn't offer `generate_image`. Each image takes about 30–40 seconds and returns a PNG, typically 1536×1024.
+
 A plain-text notification:
 
 ```yaml
@@ -110,6 +130,7 @@ A plain-text notification:
   - Home Assistant runs those tools itself, so exposure settings and permissions apply. Any other permission request is denied.
 - Earlier turns of a conversation are sent as context with each new turn. Tool calls and results appear in the conversation's debug view like any other agent.
 - Structured output uses Copilot's native JSON-schema support, with a strict schema derived from your `structure`. For models that ignore it, the reply is parsed leniently.
+- Image tasks run in a separate session where only Copilot's built-in image tool is enabled and approved. The session ends as soon as the image arrives.
 
 ## Billing and limits
 
@@ -117,7 +138,7 @@ Each conversation turn or AI task counts as a Copilot request against your plan.
 
 Known limitations:
 
-- `ai_task.generate_image` is not supported yet.
+- Image generation relies on an experimental Copilot SDK API, so it may change between SDK versions. The integration pins the SDK version.
 - Image attachments must fit the model's limits (usually 1–5 images of up to about 3 MB each).
 - Gemini models don't enforce structured output natively. They usually still return valid JSON, but stricter models are more reliable for structured tasks.
 
